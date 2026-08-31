@@ -30,7 +30,7 @@ pipeline {
       agent { label 'gha-windows' }
       steps {
         checkout scm
-        bat 'set PYTHONUTF8=1 && python tests\\test_decrypt.py'
+        bat 'set "PYTHONUTF8=1" && python tests\\test_decrypt.py'
       }
     }
 
