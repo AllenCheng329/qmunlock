@@ -1,4 +1,5 @@
 pipeline {
+  // This project doubles as a hosted-agent integration check.
   agent none
 
   options {
