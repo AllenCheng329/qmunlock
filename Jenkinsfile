@@ -1,4 +1,5 @@
 pipeline {
+  // Windows and macOS stages produce the publishable desktop installers.
   agent none
 
   options {
