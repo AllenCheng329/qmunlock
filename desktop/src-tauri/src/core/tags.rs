@@ -158,12 +158,12 @@ fn meta_from_search_item(item: &Value) -> Option<SongMeta> {
     })
 }
 
-/// 用「歌名 / 歌手」关键词反查曲库条目。
+/// 用「歌名 / 歌手」关键词反查曲库条目，返回全部有效候选。
 ///
 /// 供普通音频（没有 musicex footer、拿不到歌曲 MID）使用：拿文件名当关键词检索。
 /// 搜索结果里 `songmid` 为 "0" 的是聚合条目，真实 MID 藏在它的 `grp` 子项里，
-/// 这里会自动下钻一层。
-pub async fn search_song(query: &str) -> Result<SongMeta> {
+/// 这里会自动下钻一层。候选按曲库返回顺序保留，由调用方结合文件自带标签挑选。
+pub async fn search_songs(query: &str) -> Result<Vec<SongMeta>> {
     let query = query.trim();
     if query.is_empty() {
         return Err(Error::from("缺少检索关键词，无法查询曲库信息"));
@@ -178,19 +178,49 @@ pub async fn search_song(query: &str) -> Result<SongMeta> {
         .pointer("/data/song/list")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::from("曲库搜索未返回结果"))?;
+    let mut candidates = Vec::new();
     for item in list {
         if let Some(meta) = meta_from_search_item(item) {
-            return Ok(meta);
+            candidates.push(meta);
         }
         if let Some(group) = item.get("grp").and_then(Value::as_array) {
             for child in group {
                 if let Some(meta) = meta_from_search_item(child) {
-                    return Ok(meta);
+                    candidates.push(meta);
                 }
             }
         }
     }
-    Err(Error::from(format!("曲库中检索不到「{query}」")))
+    Ok(candidates)
+}
+
+/// 从检索候选里挑出与文件指向同一首歌的条目。
+///
+/// 文件有标签时按曲库顺序逐条校验、取第一个匹配项：只取第一条会在它与标签不符时
+/// 漏掉后面正确的结果；文件无标签时取第一个候选，维持按文件名检索的原行为。
+pub fn pick_matching_meta(
+    query: &str,
+    candidates: Vec<SongMeta>,
+    embedded: Option<&EmbeddedTags>,
+) -> Result<SongMeta> {
+    match embedded {
+        Some(tags) => {
+            let total = candidates.len();
+            let picked = candidates
+                .into_iter()
+                .find(|meta| matches_embedded_tags(meta, tags));
+            picked.ok_or_else(|| {
+                Error::from(format!(
+                    "曲库 {total} 条候选均与文件标签《{}》{} 不符，已跳过",
+                    tags.title, tags.artist
+                ))
+            })
+        }
+        None => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::from(format!("曲库中检索不到「{query}」"))),
+    }
 }
 
 /// 文件自带标签（标题 / 艺术家 / 专辑）。
@@ -261,21 +291,27 @@ fn vorbis_tags(data: &[u8]) -> Option<EmbeddedTags> {
 }
 
 /// ID3v2.3 / 2.4：只取 TIT2（标题）、TPE1（艺术家）、TALB（专辑）三个文本帧。
+///
+/// 只按 ID3 头部声明的长度读取标签区，不把整个音频载入内存；APIC、COMM 等无关帧
+/// 按帧长跳过并继续读取后续帧，歌名 / 歌手排在它们后面时也不会漏。
 fn read_id3v2_tags(path: &Path) -> Option<EmbeddedTags> {
-    let data = std::fs::read(path).ok()?;
-    if data.get(0..3)? != b"ID3" {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..3] != b"ID3" {
         return None;
     }
-    let version = *data.get(3)?;
-    let size = synchsafe(data.get(6..10)?)? as usize;
-    let end = usize::min(data.len(), 10 + size);
+    let version = header[3];
+    let size = synchsafe(&header[6..10])? as usize;
+    let mut data = Vec::new();
+    file.take(size as u64).read_to_end(&mut data).ok()?;
+    let end = data.len();
     let mut tags = EmbeddedTags::default();
-    let mut offset = 10usize;
+    let mut offset = 0usize;
     while offset + 10 <= end {
-        let id = std::str::from_utf8(data.get(offset..offset + 4)?).ok()?;
-        if !id.starts_with('T') {
+        let Ok(id) = std::str::from_utf8(data.get(offset..offset + 4)?) else {
             break;
-        }
+        };
         let frame_size = if version >= 4 {
             synchsafe(data.get(offset + 4..offset + 8)?)? as usize
         } else {
@@ -284,11 +320,14 @@ fn read_id3v2_tags(path: &Path) -> Option<EmbeddedTags> {
         if frame_size == 0 {
             break;
         }
-        let text = id3_text(data.get(offset + 10..offset + 10 + frame_size)?);
+        let Some(body) = data.get(offset + 10..offset + 10 + frame_size) else {
+            break;
+        };
         match id {
-            "TIT2" => tags.title = text,
-            "TPE1" if tags.artist.is_empty() => tags.artist = text,
-            "TALB" => tags.album = text,
+            "TIT2" => tags.title = id3_text(body),
+            "TPE1" if tags.artist.is_empty() => tags.artist = id3_text(body),
+            "TALB" => tags.album = id3_text(body),
+            // 无关帧（封面、评论、私有帧等）：按帧长跳过，继续读后续帧
             _ => {}
         }
         offset += 10 + frame_size;
@@ -382,13 +421,21 @@ fn same_song_name(left: &str, right: &str) -> bool {
 /// 曲库检索结果是否与文件自带标签指向同一首歌。
 ///
 /// 文件没有标签（或只有专辑名）时返回 true：没有可比信息，维持按文件名检索的原行为。
-/// 标题或歌手明显对不上时返回 false，调用方应跳过而不是写错封面 / 歌词 / 曲库。
+/// 标题、歌手或专辑明显对不上时返回 false，调用方应跳过而不是写错封面 / 歌词 / 曲库；
+/// 专辑参与比较是为了区分同名同歌手的不同专辑版本。
 pub fn matches_embedded_tags(meta: &SongMeta, tags: &EmbeddedTags) -> bool {
     if tags.title.is_empty() && tags.artist.is_empty() {
         return true;
     }
     if !tags.title.is_empty() && !same_song_name(&meta.title, &tags.title) {
         return false;
+    }
+    if !tags.album.is_empty() && !meta.album.is_empty() {
+        let left = normalize_for_match(&tags.album);
+        let right = normalize_for_match(&meta.album);
+        if left != right {
+            return false;
+        }
     }
     if tags.artist.is_empty() || meta.singers.is_empty() {
         return true;
@@ -1164,5 +1211,113 @@ mod tests {
             "文件没有标签时维持原有按文件名检索的行为"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一个最小 ID3v2.3 标签：两个无关帧（APIC/COMM）排在文本帧前面，
+    /// 标签区结束后再拼一段「假帧」，验证解析既会跳帧、也停在声明长度处。
+    fn write_id3_sample(path: &Path) {
+        fn synchsafe_bytes(value: usize) -> [u8; 4] {
+            [
+                (value >> 21) as u8 & 0x7F,
+                (value >> 14) as u8 & 0x7F,
+                (value >> 7) as u8 & 0x7F,
+                value as u8 & 0x7F,
+            ]
+        }
+        fn frame(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(id);
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(&[0u8; 2]);
+            out.extend_from_slice(body);
+            out
+        }
+        fn text_frame(id: &[u8; 4], text: &str) -> Vec<u8> {
+            let mut body = vec![0u8];
+            body.extend_from_slice(text.as_bytes());
+            frame(id, &body)
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(&frame(b"APIC", b"DECOYDATA"));
+        body.extend_from_slice(&frame(b"COMM", b"DECOYDATA"));
+        body.extend_from_slice(&text_frame(b"TIT2", "GLORIA"));
+        body.extend_from_slice(&text_frame(b"TPE1", "G.E.M.邓紫棋"));
+        body.extend_from_slice(&text_frame(b"TALB", "启示录"));
+        let mut file = Vec::new();
+        file.extend_from_slice(b"ID3");
+        file.extend_from_slice(&[3, 0, 0]);
+        file.extend_from_slice(&synchsafe_bytes(body.len()));
+        file.extend_from_slice(&body);
+        // 标签区之外的假 TIT2 帧：不应被读进标题
+        file.extend_from_slice(b"TIT2");
+        file.extend_from_slice(&[0xFF; 16]);
+        std::fs::write(path, &file).unwrap();
+    }
+
+    #[test]
+    fn id3_tags_skip_decoy_frames_and_stop_at_tag_end() {
+        let dir = std::env::temp_dir().join(format!("qmunlock-tags-id3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tagged.mp3");
+        write_id3_sample(&file);
+
+        let found = read_embedded_tags(&file).expect("应读到 ID3v2 标签");
+        assert_eq!(found.title, "GLORIA", "无关帧后面的标题帧不能漏");
+        assert_eq!(found.artist, "G.E.M.邓紫棋");
+        assert_eq!(found.album, "启示录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_walks_candidates_and_compares_album() {
+        let tags = EmbeddedTags {
+            title: "GLORIA".into(),
+            artist: "G.E.M.邓紫棋".into(),
+            album: "启示录".into(),
+        };
+        let wrong_title = SongMeta {
+            album_mid: "a".into(),
+            album: "启示录".into(),
+            title: "泡沫".into(),
+            singers: "G.E.M.邓紫棋".into(),
+            song_id: 1,
+            song_mid: "a".into(),
+        };
+        let right = SongMeta {
+            album_mid: "b".into(),
+            title: "GLORIA".into(),
+            ..wrong_title.clone()
+        };
+        let picked = pick_matching_meta("GLORIA", vec![wrong_title.clone(), right], Some(&tags))
+            .expect("应跳过第一条不符候选、选中后面匹配的一条");
+        assert_eq!(picked.album_mid, "b");
+
+        let other_album = SongMeta {
+            album: "新的心跳".into(),
+            title: "GLORIA".into(),
+            ..wrong_title.clone()
+        };
+        assert!(
+            pick_matching_meta("GLORIA", vec![other_album], Some(&tags)).is_err(),
+            "同名同歌手但专辑不同应判为不符"
+        );
+
+        let first = pick_matching_meta(
+            "GLORIA",
+            vec![
+                wrong_title,
+                SongMeta {
+                    album_mid: "b".into(),
+                    album: "启示录".into(),
+                    title: "GLORIA".into(),
+                    singers: "G.E.M.邓紫棋".into(),
+                    song_id: 2,
+                    song_mid: "b".into(),
+                },
+            ],
+            None,
+        )
+        .expect("无标签时取第一个候选");
+        assert_eq!(first.album_mid, "a", "无标签应维持取第一条的原行为");
     }
 }

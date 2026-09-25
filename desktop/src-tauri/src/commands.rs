@@ -397,15 +397,9 @@ async fn enhance_plain(
             FRAC_COVER,
             "正在检索曲库",
         );
-        let meta = tags::search_song(&query).await?;
-        if let Some(found) = embedded.as_ref() {
-            if !tags::matches_embedded_tags(&meta, found) {
-                return Err(Error::from(format!(
-                    "检索到《{}》{}，与文件标签《{}》{} 不符，已跳过",
-                    meta.title, meta.singers, found.title, found.artist
-                )));
-            }
-        }
+        // 检索返回全部候选，再结合文件标签逐条校验挑出同一首歌，避免错配版本
+        let candidates = tags::search_songs(&query).await?;
+        let meta = tags::pick_matching_meta(&query, candidates, embedded.as_ref())?;
 
         let mut notes: Vec<String> = Vec::new();
         // 「封面」= 内嵌封面 + 访达自定义图标（macOS），理由同 decorate_output

@@ -102,6 +102,14 @@ All notable changes to QM Unlock are documented here.
   `as_chunks::<2>()`. The FLAC STREAMINFO helpers are compiled only on macOS
   (plus tests), their sole production caller, so Windows builds no longer trip
   `dead_code` under `-D warnings`.
+- ID3v2 parsing stopped at the first non-text frame (APIC, COMM, ...), losing
+  title/artist frames placed after it; unrelated frames are now skipped by
+  their declared size and parsing continues.
+- ID3v2 tags are read only for the header-declared tag region instead of the
+  whole audio file, avoiding full-file memory loads on large batches.
+- Library search now returns every candidate and the caller walks them in
+  order, picking the first that matches the embedded tags; validation also
+  compares album, so same-title same-artist album variants no longer mismatch.
 
 ## [1.0.0] - 2026-08-25
 
