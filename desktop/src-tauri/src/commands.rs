@@ -299,6 +299,37 @@ async fn decrypt_one(
     }
 }
 
+/// 「副本」模式的目标路径：既不能等于源路径，也不能覆盖目录里已有的文件。
+///
+/// 未选输出目录时目录就是源目录，同名会与源同路径，「副本」就变成改原文件；
+/// 选了目录也可能撞同名文件。两种情况都追加「副本 / 副本 2 …」序号避开。
+fn unique_copy_target(input: &Path, dir: &Path) -> PathBuf {
+    let name = input
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_default();
+    let stem = input
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = input
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+    let mut dest = dir.join(name);
+    let mut index = 2u32;
+    while dest.as_path() == input || dest.exists() {
+        let suffix = if index == 2 {
+            String::new()
+        } else {
+            format!(" {}", index - 1)
+        };
+        dest = dir.join(format!("{stem} 副本{suffix}{ext}"));
+        index += 1;
+    }
+    dest
+}
+
 /// 普通音频通道：不解密，只做封面 / 歌词 / 曲库增强。
 ///
 /// 曲库信息按文件名（去掉扩展名）检索；`plain_copy` 为真时先复制副本再改副本，
@@ -333,11 +364,8 @@ async fn enhance_plain(
                 .or_else(|| input.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| PathBuf::from("."));
             std::fs::create_dir_all(&dir)?;
-            let name = input.file_name().ok_or_else(|| Error::from("缺少文件名"))?;
-            let dest = dir.join(name);
-            if dest.as_path() != input {
-                std::fs::copy(input, &dest)?;
-            }
+            let dest = unique_copy_target(input, &dir);
+            std::fs::copy(input, &dest)?;
             dest
         } else {
             input.to_path_buf()
@@ -348,6 +376,18 @@ async fn enhance_plain(
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_owned();
+        // 文件自带标签比文件名可靠：优先用它构造检索词，并校验检索结果是否同一首歌
+        let embedded = tags::read_embedded_tags(input);
+        let query = match embedded.as_ref() {
+            Some(found) if !found.title.is_empty() => {
+                if found.artist.is_empty() {
+                    found.title.clone()
+                } else {
+                    format!("{} {}", found.title, found.artist)
+                }
+            }
+            _ => stem,
+        };
         emit_frac(
             app,
             "cover",
@@ -355,9 +395,17 @@ async fn enhance_plain(
             file_index,
             file_total,
             FRAC_COVER,
-            "正在按文件名检索曲库",
+            "正在检索曲库",
         );
-        let meta = tags::search_song(&stem).await?;
+        let meta = tags::search_song(&query).await?;
+        if let Some(found) = embedded.as_ref() {
+            if !tags::matches_embedded_tags(&meta, found) {
+                return Err(Error::from(format!(
+                    "检索到《{}》{}，与文件标签《{}》{} 不符，已跳过",
+                    meta.title, meta.singers, found.title, found.artist
+                )));
+            }
+        }
 
         let mut notes: Vec<String> = Vec::new();
         // 「封面」= 内嵌封面 + 访达自定义图标（macOS），理由同 decorate_output
@@ -766,5 +814,33 @@ fn collect(path: &Path, files: &mut Vec<PathBuf>) {
         } else if core::supported_path(&path) {
             files.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_target_avoids_source_and_existing_files() {
+        let dir = std::env::temp_dir().join(format!("qmunlock-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("song.flac");
+        std::fs::write(&source, b"x").unwrap();
+
+        // 未选输出目录时目录即源目录，必须避开源路径，否则「副本」变成改原文件
+        let first = unique_copy_target(&source, &dir);
+        assert_ne!(first, source);
+        assert_eq!(first.file_name().unwrap(), "song 副本.flac");
+
+        std::fs::write(&first, b"x").unwrap();
+        let second = unique_copy_target(&source, &dir);
+        assert_eq!(second.file_name().unwrap(), "song 副本 2.flac");
+
+        // 选了空目录：直接用原名，不加后缀，也不覆盖任何东西
+        let other = dir.join("out");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(unique_copy_target(&source, &other), other.join("song.flac"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

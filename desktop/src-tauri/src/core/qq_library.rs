@@ -168,14 +168,24 @@ mod mac {
             .unwrap_or_default()
     }
 
+    /// 同一秒内多次备份时追加序号，避免后一次覆盖前一次的副本。
+    fn unique_backup_dir(root: &Path, stamp: u64) -> PathBuf {
+        let base = root.join(stamp.to_string());
+        let mut dir = base;
+        let mut index = 1u32;
+        while dir.exists() {
+            dir = root.join(format!("{stamp}-{index}"));
+            index += 1;
+        }
+        dir
+    }
+
     fn backup(db: &Path) -> Result<PathBuf> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_secs())
             .unwrap_or_default();
-        let dir = app_data_dir()
-            .join("qq-library-backups")
-            .join(stamp.to_string());
+        let dir = unique_backup_dir(&app_data_dir().join("qq-library-backups"), stamp);
         std::fs::create_dir_all(&dir)?;
         for suffix in ["", "-wal", "-shm"] {
             let source = PathBuf::from(format!("{}{suffix}", db.display()));
@@ -198,13 +208,18 @@ mod mac {
         let size = std::fs::metadata(path)?.len();
         let song_columns = columns(db, "SONGS");
         let folder_columns = columns(db, "NEWFOLDERSONGS");
-        let first_singer = entry
-            .singer
-            .split(['、', ',', '/'])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
+        // 旧记录只清理「与当前文件明确对应」的：同一路径的重复行，或同目录同名的
+        // 加密源（mgg / mmp4）。不再按歌名 + 歌手前缀删，避免误删同名歌曲的其他版本。
+        let dir = path
+            .parent()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stale_mgg = format!("{dir}/{stem}.mgg");
+        let stale_mmp4 = format!("{dir}/{stem}.mmp4");
 
         let mut insert_columns = vec!["id", "type", "name", "singer"];
         let mut insert_values = vec![
@@ -246,8 +261,8 @@ mod mac {
              WHERE NOT EXISTS (SELECT 1 FROM SONGS WHERE id={id} AND type={SONG_TYPE});\n\
              UPDATE SONGS SET file='{file}', filesize={size}{extra}\n\
              WHERE id={id} AND type={SONG_TYPE};\n\
-             DELETE FROM SONGS WHERE name='{title}' AND file<>'' AND singer LIKE '{singer}%'\n\
-             AND NOT (id={id} AND type={SONG_TYPE});\n\
+             DELETE FROM SONGS WHERE file<>'' AND NOT (id={id} AND type={SONG_TYPE})\n\
+             AND (file='{file}' OR file='{mgg}' OR file='{mmp4}');\n\
              INSERT INTO NEWFOLDERSONGS ({folder_insert})\n\
              SELECT {folder_select}\n\
              WHERE NOT EXISTS (SELECT 1 FROM NEWFOLDERSONGS WHERE seq={DOWNLOAD_SEQ} AND id={id});\n\
@@ -264,8 +279,8 @@ mod mac {
             } else {
                 String::new()
             },
-            title = escape(&entry.title),
-            singer = escape(&first_singer),
+            mgg = escape(&stale_mgg),
+            mmp4 = escape(&stale_mmp4),
             folder_insert = folder_columns_sql.join(", "),
             folder_select = folder_values.join(", "),
         ))
@@ -357,6 +372,76 @@ mod mac {
             database_found: database_path().is_some(),
             app_running: app_running(),
             message: None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn backup_dirs_never_collide() {
+            let root =
+                std::env::temp_dir().join(format!("qmunlock-lib-backup-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("1700000000")).unwrap();
+
+            let first = unique_backup_dir(&root, 1700000000);
+            assert_eq!(first.file_name().unwrap(), "1700000000-1");
+            std::fs::create_dir_all(&first).unwrap();
+            let second = unique_backup_dir(&root, 1700000000);
+            assert_eq!(
+                second.file_name().unwrap(),
+                "1700000000-2",
+                "同一秒内不能复用目录"
+            );
+            let fresh = unique_backup_dir(&root, 1700000001);
+            assert_eq!(fresh.file_name().unwrap(), "1700000001");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn delete_predicate_only_touches_matching_files() {
+            let dir = std::env::temp_dir().join(format!("qmunlock-lib-sql-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("qqmusic.sqlite");
+            let audio = dir.join("song.flac");
+            std::fs::write(&audio, b"fake").unwrap();
+            let created = std::process::Command::new("sqlite3")
+                .arg(&db)
+                .arg(
+                    "CREATE TABLE SONGS(id INTEGER, type INTEGER, name TEXT, singer TEXT, \
+                     album TEXT, file TEXT, filesize INTEGER, K_SONG_RESERVE9 TEXT, \
+                     K_SONG_RESERVEINT23 INTEGER); \
+                     CREATE TABLE NEWFOLDERSONGS(seq INTEGER, id INTEGER, type INTEGER, \
+                     addtime TEXT, opType INTEGER, needSyn INTEGER); \
+                     CREATE TABLE NEWFOLDERS(seq INTEGER, foldercount INTEGER);",
+                )
+                .status()
+                .unwrap();
+            assert!(created.success(), "测试库创建失败");
+
+            let entry = LibraryEntry {
+                file: audio.display().to_string(),
+                song_id: 42,
+                title: "同名歌".into(),
+                singer: "某歌手".into(),
+                album: "某专辑".into(),
+                album_mid: "mid".into(),
+            };
+            let sql = build_sql(&db, &entry).unwrap();
+            assert!(!sql.contains("singer LIKE"), "不应再按歌手前缀删除：{sql}");
+            assert!(!sql.contains("name='同名歌' AND file"), "不应再按歌名删除");
+            let mgg = dir.join("song.mgg").display().to_string();
+            assert!(
+                sql.contains(&format!("file='{}'", escape(&mgg))),
+                "应清理同目录同名加密源：{sql}"
+            );
+            assert!(
+                sql.contains(&format!("file='{}'", escape(&entry.file))),
+                "应清理同路径重复行：{sql}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

@@ -110,10 +110,13 @@ for nested_root in \
     codesign --verify --deep --strict "$nested_code"
     NESTED_COUNT=$((NESTED_COUNT + 1))
   done < <(
+    # 两个匹配分支必须整体括起来再 -print0，否则 -print0 只作用于文件分支，
+    # .app / .framework 目录不会进入逐项校验循环。
     find "$nested_root" \
-      \( -type d \( -name '*.app' -o -name '*.framework' \) \) -o \
-      \( -type f \( -name '*.dylib' -o -perm -111 \) \) \
-      -print0
+      \( \
+        \( -type d \( -name '*.app' -o -name '*.framework' \) \) -o \
+        \( -type f \( -name '*.dylib' -o -perm -111 \) \) \
+      \) -print0
   )
 done
 echo "   嵌套代码校验通过：${NESTED_COUNT} 项"

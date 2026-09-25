@@ -18,10 +18,10 @@ All notable changes to QM Unlock are documented here.
 - `os_platform` command so macOS-only library features are hidden on other
   platforms regardless of credential state.
 - Styled DMG packaging: `desktop/scripts/make_dmg_styled.sh` produces a
-  compressed read-only image with the dark brand background, a 660x400 Finder
-  window, 96px icons, the app on the left and Applications on the right, plus a
-  custom volume icon. It runs headless, with no AppleScript and no third-party
-  packaging tool.
+  compressed read-only image with a blank 660x400 Finder window, 84px icons, the
+  app on the left, Applications on the right, the install notes in the top-right
+  corner and a custom volume icon. It runs headless, with no AppleScript and no
+  third-party packaging tool.
 - `desktop/scripts/dmg-template.DS_Store`, the committed layout template, and
   `dmg_layout.py`, which derives it from a Finder-approved sample by rewriting
   only the volume name (5 places in the Alias v2 record) and the item names,
@@ -78,6 +78,25 @@ All notable changes to QM Unlock are documented here.
 - Queue list could grow past the window, overlap the footer and refuse to scroll.
 - Duplicated app name rows in the macOS titlebar (system title plus custom bar).
 - Drag veil flickered when the pointer moved over child elements.
+- Copy mode could modify the source or overwrite an existing file when the target
+  equalled the source path or a same-name file; copy targets now take a
+  「副本 / 副本 2 …」 suffix until they collide with neither.
+- Library linking deleted stale rows by song name plus singer prefix, which could
+  remove other versions of the same song; the DELETE predicate now matches only
+  rows whose path equals the target or the same-directory encrypted source
+  (`.mgg` / `.mmp4`).
+- Cover embedding removed every PICTURE block, losing back covers and artist
+  photos; only the front cover (type 3) is replaced, and verification now also
+  asserts the other-picture count is unchanged.
+- Same-second library backups overwrote each other; backup directories now take a
+  `-1`, `-2` … suffix when the timestamped name is already taken.
+- The packaging `find` expression applied `-print0` only to the file branch, so
+  nested `.app` / `.framework` bundles skipped per-item signature verification;
+  both branches are grouped before `-print0`.
+- Plain-audio identity now prefers the file's own tags (FLAC Vorbis comments,
+  MP3 ID3v2) for the search query and for a match check; when the search result
+  disagrees with those tags the file is skipped instead of receiving another
+  song's cover, lyric or library link.
 
 ## [1.0.0] - 2026-08-25
 

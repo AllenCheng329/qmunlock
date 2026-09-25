@@ -20,6 +20,9 @@ AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 
 const BLOCK_PICTURE: u8 = 6;
 const BLOCK_VORBIS_COMMENT: u8 = 4;
+/// FLAC PICTURE 块的图片类型：3 = 正面封面。替换封面时只动这一类，
+/// 封底（4）、艺术家（8）等其他内嵌图片必须原样保留。
+const PICTURE_TYPE_FRONT: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct SongMeta {
@@ -188,6 +191,217 @@ pub async fn search_song(query: &str) -> Result<SongMeta> {
         }
     }
     Err(Error::from(format!("曲库中检索不到「{query}」")))
+}
+
+/// 文件自带标签（标题 / 艺术家 / 专辑）。
+///
+/// 普通音频没有 musicex footer，只能靠检索猜身份；文件内已有的标签是比文件名
+/// 更可靠的依据，用来构造检索词并校验检索结果是否指向同一首歌。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmbeddedTags {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+}
+
+/// 读取文件自带标签：FLAC 走 Vorbis 注释，MP3 走 ID3v2；其他格式或无标签返回 None。
+pub fn read_embedded_tags(path: &Path) -> Option<EmbeddedTags> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("flac") => read_flac_tags(path),
+        Some("mp3") => read_id3v2_tags(path),
+        _ => None,
+    }
+}
+
+fn read_flac_tags(path: &Path) -> Option<EmbeddedTags> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let blocks = read_blocks(&mut file).ok()?;
+    let comment = blocks
+        .iter()
+        .find(|(kind, _)| *kind == BLOCK_VORBIS_COMMENT)
+        .map(|(_, data)| data)?;
+    vorbis_tags(comment)
+}
+
+/// Vorbis 注释块：供应商字符串长度 + 内容 + 条目数 + 每条「NAME=value」。
+fn vorbis_tags(data: &[u8]) -> Option<EmbeddedTags> {
+    let mut tags = EmbeddedTags::default();
+    let mut offset = 0usize;
+    let vendor = u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?) as usize;
+    offset += 4 + vendor;
+    let count = u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?) as usize;
+    offset += 4;
+    for _ in 0..count {
+        let length = u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?) as usize;
+        offset += 4;
+        let entry = String::from_utf8_lossy(data.get(offset..offset + length)?).to_string();
+        offset += length;
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        match name.to_ascii_uppercase().as_str() {
+            "TITLE" => tags.title = value.to_owned(),
+            "ARTIST" | "ALBUMARTIST" if tags.artist.is_empty() => {
+                tags.artist = value.to_owned();
+            }
+            "ALBUM" => tags.album = value.to_owned(),
+            _ => {}
+        }
+    }
+    if tags.title.is_empty() && tags.artist.is_empty() && tags.album.is_empty() {
+        None
+    } else {
+        Some(tags)
+    }
+}
+
+/// ID3v2.3 / 2.4：只取 TIT2（标题）、TPE1（艺术家）、TALB（专辑）三个文本帧。
+fn read_id3v2_tags(path: &Path) -> Option<EmbeddedTags> {
+    let data = std::fs::read(path).ok()?;
+    if data.get(0..3)? != b"ID3" {
+        return None;
+    }
+    let version = *data.get(3)?;
+    let size = synchsafe(data.get(6..10)?)? as usize;
+    let end = usize::min(data.len(), 10 + size);
+    let mut tags = EmbeddedTags::default();
+    let mut offset = 10usize;
+    while offset + 10 <= end {
+        let id = std::str::from_utf8(data.get(offset..offset + 4)?).ok()?;
+        if !id.starts_with('T') {
+            break;
+        }
+        let frame_size = if version >= 4 {
+            synchsafe(data.get(offset + 4..offset + 8)?)? as usize
+        } else {
+            u32::from_be_bytes(data.get(offset + 4..offset + 8)?.try_into().ok()?) as usize
+        };
+        if frame_size == 0 {
+            break;
+        }
+        let text = id3_text(data.get(offset + 10..offset + 10 + frame_size)?);
+        match id {
+            "TIT2" => tags.title = text,
+            "TPE1" if tags.artist.is_empty() => tags.artist = text,
+            "TALB" => tags.album = text,
+            _ => {}
+        }
+        offset += 10 + frame_size;
+    }
+    if tags.title.is_empty() && tags.artist.is_empty() && tags.album.is_empty() {
+        None
+    } else {
+        Some(tags)
+    }
+}
+
+/// ID3 的 synchsafe 整数：每字节只用低 7 位。
+fn synchsafe(bytes: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = bytes.try_into().ok()?;
+    Some(
+        u32::from(bytes[0] & 0x7F) << 21
+            | u32::from(bytes[1] & 0x7F) << 14
+            | u32::from(bytes[2] & 0x7F) << 7
+            | u32::from(bytes[3] & 0x7F),
+    )
+}
+
+/// ID3 文本帧首字节是编码：0 Latin-1、1 UTF-16 带 BOM、2 UTF-16BE、3 UTF-8。
+fn id3_text(body: &[u8]) -> String {
+    let Some((encoding, text)) = body.split_first() else {
+        return String::new();
+    };
+    let decoded = match encoding {
+        1 => {
+            let big_endian = text.get(0..2) == Some(&[0xFE, 0xFF][..]);
+            let skip = if text.len() >= 2
+                && ((text[0] == 0xFF && text[1] == 0xFE) || (text[0] == 0xFE && text[1] == 0xFF))
+            {
+                2
+            } else {
+                0
+            };
+            let units: Vec<u16> = text[skip..]
+                .chunks_exact(2)
+                .map(|pair| {
+                    if big_endian {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        2 => {
+            let units: Vec<u16> = text
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        }
+        // Latin-1 的中文标签几乎不存在，按 UTF-8 近似解析即可
+        _ => String::from_utf8_lossy(text).to_string(),
+    };
+    decoded.trim_matches('\0').trim().to_owned()
+}
+
+/// 归一化：小写并去掉空格与括号、间隔号等标点，只留可比较的字符。
+fn normalize_for_match(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !ch.is_whitespace()
+                && !matches!(
+                    ch,
+                    '(' | ')' | '（' | '）' | '·' | '-' | '_' | '\'' | '"' | '、' | ',' | '，'
+                )
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 标题是否同一首：归一化后相等，或一方包含另一方（容忍「(Live)」一类后缀差异）。
+fn same_song_name(left: &str, right: &str) -> bool {
+    let left = normalize_for_match(left);
+    let right = normalize_for_match(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right || left.contains(&right) || right.contains(&left)
+}
+
+/// 曲库检索结果是否与文件自带标签指向同一首歌。
+///
+/// 文件没有标签（或只有专辑名）时返回 true：没有可比信息，维持按文件名检索的原行为。
+/// 标题或歌手明显对不上时返回 false，调用方应跳过而不是写错封面 / 歌词 / 曲库。
+pub fn matches_embedded_tags(meta: &SongMeta, tags: &EmbeddedTags) -> bool {
+    if tags.title.is_empty() && tags.artist.is_empty() {
+        return true;
+    }
+    if !tags.title.is_empty() && !same_song_name(&meta.title, &tags.title) {
+        return false;
+    }
+    if tags.artist.is_empty() || meta.singers.is_empty() {
+        return true;
+    }
+    let wanted = normalize_for_match(
+        tags.artist
+            .split(['、', ',', '/'])
+            .next()
+            .unwrap_or_default(),
+    );
+    if wanted.is_empty() {
+        return true;
+    }
+    meta.singers.split('、').any(|singer| {
+        let singer = normalize_for_match(singer);
+        !singer.is_empty() && (singer.contains(&wanted) || wanted.contains(&singer))
+    })
 }
 
 /// 极简百分号编码：只保留检索关键词里安全的字符。
@@ -364,15 +578,34 @@ fn write_blocks(file: &mut std::fs::File, blocks: &[(u8, Vec<u8>)]) -> Result<()
     Ok(())
 }
 
-/// 把封面写入 FLAC 的 PICTURE 块（先移除旧封面，音频数据原样复制）。
+/// PICTURE 块数据的前 4 字节是大端图片类型。
+fn picture_type(data: &[u8]) -> u32 {
+    data.get(0..4)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(u32::MAX)
+}
+
+/// 是否为正面封面图（替换时唯一会被移除的一类）。
+fn is_front_picture(block: &(u8, Vec<u8>)) -> bool {
+    block.0 == BLOCK_PICTURE && picture_type(&block.1) == PICTURE_TYPE_FRONT
+}
+
+/// 把封面写入 FLAC 的 PICTURE 块。
+///
+/// 只替换「正面封面」这一类图片：封底、艺术家照片等其他 PICTURE 块原样保留，
+/// 音频数据原样复制。
 pub fn embed_cover_into_flac(path: &Path, image: &[u8], description: &str) -> Result<()> {
     let mut source = std::fs::File::open(path)?;
     let blocks = read_blocks(&mut source)?;
     let audio_offset = source.stream_position()?;
 
+    let kept_pictures = blocks
+        .iter()
+        .filter(|block| block.0 == BLOCK_PICTURE && !is_front_picture(block))
+        .count();
     let mut merged: Vec<(u8, Vec<u8>)> = blocks
         .into_iter()
-        .filter(|(kind, _)| *kind != BLOCK_PICTURE)
+        .filter(|block| !is_front_picture(block))
         .collect();
     let insert_at = merged
         .iter()
@@ -395,23 +628,27 @@ pub fn embed_cover_into_flac(path: &Path, image: &[u8], description: &str) -> Re
         target.sync_all().ok();
     }
 
-    // 校验：块结构可解析、只有一张封面、音频区字节数一致
+    // 校验：块结构可解析、正面封面只有一张、其他图片数量不变、音频区字节数一致
     let mut check = std::fs::File::open(&temporary)?;
     let check_blocks = read_blocks(&mut check)?;
     let check_audio_offset = check.stream_position()?;
     drop(check);
     let pictures = check_blocks
         .iter()
-        .filter(|(kind, _)| *kind == BLOCK_PICTURE)
+        .filter(|block| is_front_picture(block))
+        .count();
+    let kept = check_blocks
+        .iter()
+        .filter(|block| block.0 == BLOCK_PICTURE && !is_front_picture(block))
         .count();
     let source_audio = std::fs::metadata(path)?.len().saturating_sub(audio_offset);
     let target_audio = std::fs::metadata(&temporary)?
         .len()
         .saturating_sub(check_audio_offset);
-    if pictures != 1 || source_audio != target_audio {
+    if pictures != 1 || kept != kept_pictures || source_audio != target_audio {
         let _ = std::fs::remove_file(&temporary);
         return Err(Error::from(format!(
-            "封面写入校验失败（封面块 {pictures} 个，音频区 {target_audio} / {source_audio} 字节）"
+            "封面写入校验失败（正面封面 {pictures} 个、保留图片 {kept}/{kept_pictures} 张，音频区 {target_audio} / {source_audio} 字节）"
         )));
     }
     std::fs::rename(&temporary, path)?;
@@ -790,6 +1027,135 @@ mod tests {
             1
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 造一个指定类型的 PICTURE 块数据：类型 + mime + 描述 + 尺寸字段 + 图片字节。
+    fn picture_block(kind: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&kind.to_be_bytes());
+        let mime = b"image/jpeg";
+        data.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+        data.extend_from_slice(mime);
+        let desc = b"cover";
+        data.extend_from_slice(&(desc.len() as u32).to_be_bytes());
+        data.extend_from_slice(desc);
+        data.extend_from_slice(&[0u8; 16]); // 宽 / 高 / 位深 / 色数
+        let body = tiny_jpeg();
+        data.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        data.extend_from_slice(&body);
+        data
+    }
+
+    /// 造一个带 Vorbis 标签、且同时含封底与正面封面两张图的 FLAC。
+    fn write_tagged_sample(path: &Path) {
+        let comments = ["TITLE=GLORIA", "ARTIST=G.E.M.邓紫棋", "ALBUM=启示录"];
+        let mut comment = Vec::new();
+        let vendor = b"test";
+        comment.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        comment.extend_from_slice(vendor);
+        comment.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for entry in comments {
+            comment.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            comment.extend_from_slice(entry.as_bytes());
+        }
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"fLaC");
+        data.push(0x00); // STREAMINFO
+        data.extend_from_slice(&[0x00, 0x00, 34]);
+        data.extend_from_slice(&[0u8; 34]);
+        data.push(BLOCK_VORBIS_COMMENT);
+        data.extend_from_slice(&((comment.len() as u32).to_be_bytes()[1..]));
+        data.extend_from_slice(&comment);
+        data.push(BLOCK_PICTURE); // 封底（类型 4），非最后一块
+        let back = picture_block(4);
+        data.extend_from_slice(&((back.len() as u32).to_be_bytes()[1..]));
+        data.extend_from_slice(&back);
+        data.push(0x80 | BLOCK_PICTURE); // 正面封面（类型 3），最后一块
+        let front = picture_block(3);
+        data.extend_from_slice(&((front.len() as u32).to_be_bytes()[1..]));
+        data.extend_from_slice(&front);
+        data.extend_from_slice(b"AUDIODATA");
+        std::fs::write(path, &data).unwrap();
+    }
+
+    #[test]
+    fn replaces_only_front_cover_and_keeps_others() {
+        let dir = std::env::temp_dir().join(format!("qmunlock-tags-front-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tagged.flac");
+        write_tagged_sample(&file);
+
+        embed_cover_into_flac(&file, &tiny_jpeg(), "新封面").unwrap();
+
+        let mut handle = std::fs::File::open(&file).unwrap();
+        let blocks = read_blocks(&mut handle).unwrap();
+        let fronts = blocks
+            .iter()
+            .filter(|block| is_front_picture(block))
+            .count();
+        let others = blocks
+            .iter()
+            .filter(|block| block.0 == BLOCK_PICTURE && !is_front_picture(block))
+            .count();
+        assert_eq!(fronts, 1, "正面封面应只有一张");
+        assert_eq!(others, 1, "封底等其他内嵌图片必须保留");
+        let audio = std::fs::metadata(&file).unwrap().len() - handle.stream_position().unwrap();
+        assert_eq!(audio, b"AUDIODATA".len() as u64, "音频区不能变动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_flac_tags_and_validates_search_result() {
+        let dir = std::env::temp_dir().join(format!("qmunlock-tags-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tagged.flac");
+        write_tagged_sample(&file);
+
+        let found = read_embedded_tags(&file).expect("应读到 Vorbis 标签");
+        assert_eq!(found.title, "GLORIA");
+        assert_eq!(found.artist, "G.E.M.邓紫棋");
+        assert_eq!(found.album, "启示录");
+
+        let meta = SongMeta {
+            album_mid: "mid".into(),
+            album: "启示录".into(),
+            title: "GLORIA".into(),
+            singers: "G.E.M.邓紫棋".into(),
+            song_id: 1,
+            song_mid: "mid".into(),
+        };
+        assert!(matches_embedded_tags(&meta, &found), "同名同歌手应匹配");
+
+        let live = SongMeta {
+            title: "GLORIA (Live)".into(),
+            ..meta.clone()
+        };
+        assert!(matches_embedded_tags(&live, &found), "后缀差异应容忍");
+
+        let wrong_title = SongMeta {
+            title: "泡沫".into(),
+            ..meta.clone()
+        };
+        assert!(
+            !matches_embedded_tags(&wrong_title, &found),
+            "标题不同应不匹配"
+        );
+
+        let wrong_singer = SongMeta {
+            singers: "其他人".into(),
+            ..meta.clone()
+        };
+        assert!(
+            !matches_embedded_tags(&wrong_singer, &found),
+            "歌手不同应不匹配"
+        );
+
+        assert!(
+            matches_embedded_tags(&wrong_title, &EmbeddedTags::default()),
+            "文件没有标签时维持原有按文件名检索的行为"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
