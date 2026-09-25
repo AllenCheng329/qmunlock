@@ -249,8 +249,10 @@ async fn decrypt_one(
                     &song_mid,
                     &input_name,
                     options,
-                    file_index,
-                    file_total,
+                    BatchPos {
+                        index: file_index,
+                        total: file_total,
+                    },
                 )
                 .await;
                 (notes.cover, notes.library)
@@ -492,6 +494,15 @@ fn short_library_note(note: &str) -> String {
     }
 }
 
+/// 批次位置：当前是第几个文件、共几个文件。
+/// 把两个计数器合成一个参数，避免 decorate_output 触发
+/// clippy::too_many_arguments（上限 7 个）。
+#[derive(Debug, Clone, Copy)]
+struct BatchPos {
+    index: u64,
+    total: u64,
+}
+
 /// 输出后的增强处理。
 ///
 /// 职责划分：
@@ -508,16 +519,15 @@ async fn decorate_output(
     song_mid: &str,
     input_name: &str,
     options: &DecryptOptions,
-    file_index: u64,
-    file_total: u64,
+    pos: BatchPos,
 ) -> EnhanceNotes {
     let mut notes: Vec<String> = Vec::new();
     emit_frac(
         app,
         "cover",
         input_name,
-        file_index,
-        file_total,
+        pos.index,
+        pos.total,
         FRAC_COVER,
         "正在获取曲库信息与封面",
     );
@@ -578,8 +588,8 @@ async fn decorate_output(
             app,
             "library",
             input_name,
-            file_index,
-            file_total,
+            pos.index,
+            pos.total,
             FRAC_LIBRARY,
             "正在链接 QQ 音乐本地库",
         );

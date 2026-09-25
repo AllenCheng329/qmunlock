@@ -722,6 +722,7 @@ mod tests {
             title: "GLORIA".into(),
             singers: "G.E.M.邓紫棋、某某".into(),
             song_id: 370_870_352,
+            song_mid: "001xM7yM3VfJqK".into(),
         };
         let bytes = qq_attrs::info_archive(&meta).unwrap();
         let value = plist::Value::from_reader(std::io::Cursor::new(&bytes)).unwrap();
