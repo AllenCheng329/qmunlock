@@ -97,6 +97,11 @@ All notable changes to QM Unlock are documented here.
   MP3 ID3v2) for the search query and for a match check; when the search result
   disagrees with those tags the file is skipped instead of receiving another
   song's cover, lyric or library link.
+- Cross-toolchain CI failures: UTF-16 tag decoding used `chunks_exact(2)`, which
+  clippy 1.98 rejects via `chunks_exact_to_as_chunks`; it now uses
+  `as_chunks::<2>()`. The FLAC STREAMINFO helpers are compiled only on macOS
+  (plus tests), their sole production caller, so Windows builds no longer trip
+  `dead_code` under `-D warnings`.
 
 ## [1.0.0] - 2026-08-25
 

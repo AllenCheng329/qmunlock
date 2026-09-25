@@ -327,7 +327,9 @@ fn id3_text(body: &[u8]) -> String {
                 0
             };
             let units: Vec<u16> = text[skip..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     if big_endian {
                         u16::from_be_bytes([pair[0], pair[1]])
@@ -340,7 +342,9 @@ fn id3_text(body: &[u8]) -> String {
         }
         2 => {
             let units: Vec<u16> = text
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
                 .collect();
             String::from_utf16_lossy(&units)
@@ -760,6 +764,8 @@ pub fn set_finder_icon(path: &Path, image: &[u8]) -> Result<()> {
 }
 
 /// 读取 FLAC 的 STREAMINFO，返回 (采样率, 位深)。
+/// 目前仅 macOS 的 QQ 属性写入逻辑使用，其他平台不参与编译以免产生 dead_code。
+#[cfg(target_os = "macos")]
 pub fn flac_stream_info(path: &Path) -> Option<(u32, u32)> {
     let mut file = std::fs::File::open(path).ok()?;
     let blocks = read_blocks(&mut file).ok()?;
@@ -767,6 +773,7 @@ pub fn flac_stream_info(path: &Path) -> Option<(u32, u32)> {
     parse_stream_info(&stream_info.1)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_stream_info(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() < 18 {
         return None;
